@@ -102,13 +102,17 @@ public class OracleSourceTask extends SourceTask {
   @Override
   public void start(Map<String, String> map) {
     //TODO: Do things here that are required to start your task. This could be open a connection to a database, etc.
-    config=new OracleSourceConnectorConfig(map);    
+    config=new OracleSourceConnectorConfig(map);
+    start();
+  }
+
+  private void start() {
     topic=config.getTopic();
     dbName=config.getDbNameAlias();
     parseDmlData=config.getParseDmlData();
     String startSCN = config.getStartScn();
     log.info("Oracle Kafka Connector is starting on {}",config.getDbNameAlias());
-    try {      
+    try {
       dbConn = new OracleConnection().connect(config);
       utils = new OracleSourceConnectorUtils(dbConn, config);
       int dbVersion = utils.getDbVersion();
@@ -131,20 +135,20 @@ public class OracleSourceTask extends SourceTask {
       if (offset!=null){
         Object lastRecordedOffset = offset.get(POSITION_FIELD);
         Object commitScnPositionObject = offset.get(COMMITSCN_POSITION_FIELD);
-        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);        
+        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);
         streamOffsetScn = (lastRecordedOffset != null) ? Long.parseLong(String.valueOf(lastRecordedOffset)) : 0L;
         streamOffsetCommitScn = (commitScnPositionObject != null) ? Long.parseLong(String.valueOf(commitScnPositionObject)) : 0L;
         streamOffsetRowId = (rowIdPositionObject != null) ? (String) offset.get(ROWID_POSITION_FIELD) : "";
         if (oraDeSupportCM) streamOffsetScn = streamOffsetCommitScn;
-        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);        
-      }      
+        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);
+      }
 
       if (streamOffsetScn!=0L){
         if (!oraDeSupportCM){
           streamOffsetCtrl=streamOffsetScn;
           PreparedStatement lastScnFirstPosPs=dbConn.prepareCall(OracleConnectorSQL.LASTSCN_STARTPOS);
           lastScnFirstPosPs.setLong(1, streamOffsetScn);
-          lastScnFirstPosPs.setLong(2, streamOffsetScn);        
+          lastScnFirstPosPs.setLong(2, streamOffsetScn);
           ResultSet lastScnFirstPosRSet=lastScnFirstPosPs.executeQuery();
           while(lastScnFirstPosRSet.next()){
             streamOffsetScn= lastScnFirstPosRSet.getLong("FIRST_CHANGE#");
@@ -154,19 +158,19 @@ public class OracleSourceTask extends SourceTask {
           log.info("Captured last SCN has first position:{}",streamOffsetScn);
         }
       }
-      
+
       if (!startSCN.equals("")){
         log.info("Resetting offset with specified start SCN:{}",startSCN);
         streamOffsetScn=Long.parseLong(startSCN);
         //streamOffsetScn-=1;
         skipRecord=false;
       }
-      
+
       if (config.getResetOffset()){
         log.info("Resetting offset with new SCN");
         streamOffsetScn=0L;
         streamOffsetCommitScn=0L;
-        streamOffsetRowId="";        
+        streamOffsetRowId="";
       }
 
       if (streamOffsetScn==0L){
@@ -177,7 +181,7 @@ public class OracleSourceTask extends SourceTask {
           streamOffsetScn=currentScnResultSet.getLong("CURRENT_SCN");
         }
         currentScnResultSet.close();
-        currentSCNStmt.close();        
+        currentSCNStmt.close();
         log.info("Getting current scn from database {}",streamOffsetScn);
       }
       //streamOffsetScn+=1;
@@ -185,26 +189,26 @@ public class OracleSourceTask extends SourceTask {
       log.info(String.format("Log Miner will start at new position SCN : %s with fetch size : %s", streamOffsetScn,config.getDbFetchSize()));
       if (!oraDeSupportCM){
       logMinerStartStmt.setLong(1, streamOffsetScn);
-      logMinerStartStmt.execute();      
+      logMinerStartStmt.execute();
       logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
       logMinerSelect.setFetchSize(config.getDbFetchSize());
       logMinerSelect.setLong(1, streamOffsetCommitScn);
       logMinerData=logMinerSelect.executeQuery();
       log.info("Logminer started successfully");
       }else{
-        //tLogMiner = new Thread(new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils));        
+        //tLogMiner = new Thread(new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils));
         tLogMiner = new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils);
         //tLogMiner.start();
         executor.submit(tLogMiner);
-        
+
         Runtime.getRuntime().addShutdownHook(new Thread(){
           @Override
           public void run(){
             tLogMiner.shutDown();
             executor.shutdown();
-            try {              
+            try {
               log.info("Waiting for logminer thread to shut down,exiting cleanly");
-              if (executor.awaitTermination(20000, TimeUnit.MILLISECONDS)) {                
+              if (executor.awaitTermination(20000, TimeUnit.MILLISECONDS)) {
               }
             } catch (Exception e) {
               log.error(e.getMessage());
@@ -215,7 +219,7 @@ public class OracleSourceTask extends SourceTask {
     }catch(SQLException e){
       throw new ConnectException("Error at database tier, Please check : "+e.toString());
     }
-  }    
+  }
 
   @Override
   public List<SourceRecord> poll() throws InterruptedException {
@@ -224,6 +228,14 @@ public class OracleSourceTask extends SourceTask {
     try {
       ArrayList<SourceRecord> records = new ArrayList<>();
       if (!oraDeSupportCM){
+        //双重校验并加锁防止频繁重启
+        if (dbConn == null) {
+          synchronized (this) {
+            if (dbConn == null){
+              restart();
+            }
+          }
+        }
         while(!this.closed && logMinerData.next()){
           if (log.isDebugEnabled()) {
             logRawMinerData();
@@ -283,6 +295,14 @@ public class OracleSourceTask extends SourceTask {
     }
     return null;
     
+  }
+
+  /**
+   * 利用已经启动后初始化的配置重启服务
+   */
+  private void restart() {
+    this.stop();
+    this.start();
   }
 
   @Override
